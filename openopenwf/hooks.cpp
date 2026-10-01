@@ -31,6 +31,23 @@ static void* (*OLD_ResourceMgr_Ctor)(ResourceMgr*);
 #define REQUEST_TYPE_GZIP 1
 #define REQUEST_TYPE_GZIP_PROTECTED 2
 
+static std::string g_Nonce;
+
+static void TryCaptureNonceFromURL(const std::string& url)
+{
+    if (!g_Nonce.empty()) return; // 已捕获，不重复
+
+    auto pos = url.find("nonce=");
+    if (pos == std::string::npos) return;
+    pos += 6;
+
+    auto end = url.find_first_of("&#", pos);
+    if (end == std::string::npos) end = url.size();
+
+    g_Nonce = url.substr(pos, end - pos);
+    OWFLog("[Info] Captured nonce from URL: '{}'", g_Nonce);
+}
+
 void WarframeString::Create(const std::string& data)
 {
 	InitStringFromBytes(this, std::string(data.size(), ' ').c_str());
@@ -228,6 +245,8 @@ static void NEW_SendPostRequestUnified(decltype(OLD_SendPostRequest_1) origFunc,
 	std::string newURL = ModifyURLForOpenWF(url->GetText());
 	OWFLog("[POST] {}", newURL);
 
+	TryCaptureNonceFromURL(newURL);
+
 	WarframeString alteredURL;
 	alteredURL.Create(newURL);
 	origFunc(a1, &alteredURL, bodyData, requestType, a5, a6);
@@ -247,6 +266,8 @@ static void NEW_SendGetRequestUnified(decltype(OLD_SendGetRequest_1) origFunc, W
 {
 	std::string newURL = ModifyURLForOpenWF(url->GetText());
 	OWFLog("[GET] {}", newURL);
+
+	TryCaptureNonceFromURL(newURL);
 
 	WarframeString alteredURL;
 	alteredURL.Create(newURL);
@@ -368,6 +389,43 @@ static void* NEW_ResourceMgr_Ctor(ResourceMgr* resourceMgr)
 	return OLD_ResourceMgr_Ctor(resourceMgr);
 }
 
+static void (*OLD_irc_send_raw)(void*, WarframeString*, bool);
+
+static void NEW_irc_send_raw(void* a1, WarframeString* str, bool bLogIt)
+{
+    if (!str)
+    {
+        OLD_irc_send_raw(a1, str, bLogIt);
+        return;
+    }
+
+    const int size = str->GetSize();
+    std::string data(str->GetPtr(), size);
+
+    OWFLog("[IRC] size = {}, g_Nonce = '{}', data = {}", size, g_Nonce, data);
+
+    constexpr size_t kRealnameLength = 40;
+
+    if (!g_Nonce.empty()
+        && size > kRealnameLength + 5
+        && data.compare(0, 5, "NICK ") == 0)
+    {
+        std::string replacement = data.substr(0, size - kRealnameLength)
+                                + "nonce=" + g_Nonce;
+
+        OWFLog("[IRC] original : {}", data);
+        OWFLog("[IRC] replacement: {}", replacement);
+
+        WarframeString altered;
+        altered.Create(replacement);
+        OLD_irc_send_raw(a1, &altered, bLogIt);
+        altered.Free();
+        return;
+    }
+
+    OLD_irc_send_raw(a1, str, bLogIt);
+}
+
 static void SetProtectedMemory(void* target, const void* source, size_t memSize)
 {
 	DWORD flOldProtect = 0;
@@ -477,6 +535,14 @@ void PlaceHooks()
 	resourceMgrCtor = (unsigned char*)(((ULONG_PTR)resourceMgrCtor - 5) & 0xFFFFFFFFFFFFFFF0);
 	MH_CreateHook(resourceMgrCtor, NEW_ResourceMgr_Ctor, (LPVOID*)&OLD_ResourceMgr_Ctor);
 
+	// IRC send raw
+	unsigned char* ircSendRawSig = SignatureScanMustSucceed(
+		"\x40\x55\x57\x41\x55\x41\x56\x48\x8D\x6C\x24\x00\x48\x81\xEC\x00\x00\x00\x00\x48\x8B\x05\x00\x00\x00\x00\x48\x33\xC4\x48\x89\x45\x00\x80\x79",
+		"xxxxxxxxxxx?xxx????xxx????xxxxxx?xx",
+		imageBase, g_WarframePESize, "irc_send_raw");
+	MH_CreateHook(ircSendRawSig, NEW_irc_send_raw, (LPVOID*)&OLD_irc_send_raw);
+	OWFLog("[Info] irc_send_raw signature = {:p}", (void*)ircSendRawSig);
+
 	unsigned char* buildLabelSig = SignatureScanMustSucceed("\x80\x3D\x00\x00\x00\x00\x00\x0F\x85\x00\x00\x00\x00\xE8\x00\x00\x00\x00\x48\x8B\xD8\x48\x85\xC0", "xx????xxx??xxx????xxxxxx", imageBase, g_WarframePESize, "BuildLabelString");
 	buildLabelSig += 2;
 	buildLabelSig += *(int*)buildLabelSig;
@@ -511,7 +577,7 @@ void PlaceHooks()
 	WFFree = (decltype(WFFree))wfFreeSig;
 
 	// NRS analysis (analysis always fails in OpenWF since an NRS server is not available.. yet)
-	unsigned char* nrsAnalyzeSig = SignatureScanMustSucceed("\x48\x33\xC4\x48\x89\x85\x00\x00\x00\x00\x83\xB9\x00\x00\x00\x00\x01\x4C\x8B\xE9\x75", "xxxxxx??xxxx??xxxxxxx", imageBase, g_WarframePESize, "NRSAnalyze");
+	unsigned char* nrsAnalyzeSig = SignatureScanMustSucceed("\x48\x33\xC4\x48\x89\x85\x00\x00\x00\x00\x83\xB9\x00\x00\x00\x00\x01\x4C\x8B\xE1\x75", "xxxxxx??xxxx??xxxxxxx", imageBase, g_WarframePESize, "NRSAnalyze");
 	nrsAnalyzeSig = (unsigned char*)(((ULONG_PTR)nrsAnalyzeSig - 0x15) & 0xFFFFFFFFFFFFFFF0);
 	MH_CreateHook(nrsAnalyzeSig, NEW_NRSAnalyze, (LPVOID*)&OLD_NRSAnalyze);
 
